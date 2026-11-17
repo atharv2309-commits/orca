@@ -8,14 +8,13 @@ import {
   agentSessionRecordFixture
 } from '../../../src/shared/agent-session/lifecycle/records/agent-session-record.test-fixture'
 import {
-  closeTestJournalHostDatabase,
-  openTestJournalHostDatabase
-} from '../../../src/main/native-chat/agent-session-journal/store-lifecycle/journal-host-database-test-support'
-import {
   closeTestAgentSessionDatabase,
   openTestAgentSessionRecordStore
 } from '../../../src/main/runtime/agent-session/records/agent-session-record-store-test-harness'
-import { storedTestAgentSessionRecord } from '../../../src/main/runtime/agent-session/records/agent-session-record-store-persistence.test-fixture'
+import {
+  storedTestAgentSessionRecord,
+  withTestAgentSessionDatabase
+} from '../../../src/main/runtime/agent-session/records/agent-session-record-store-persistence.test-fixture'
 import { importReleaseCheckoutModule, materializeReleaseCheckout } from './release-checkout'
 
 const idle = agentSessionRecordFixture(
@@ -38,26 +37,26 @@ for (const ref of ['v1.4.259', 'v1.4.260', 'v1.4.261']) {
   test(`${ref} treats every lease as unreconciled after this build installed the store`, { timeout: 600_000 }, async () => {
     const directory = await mkdtemp(join(tmpdir(), 'orca-l1-downgrade-'))
     try {
-      const seed = openTestJournalHostDatabase(directory).db
-      const insert = seed.prepare('INSERT INTO agent_session_records (session_id, record_json) VALUES (?, ?)')
-      insert.run('idle', JSON.stringify(storedTestAgentSessionRecord(idle)))
-      insert.run('live', JSON.stringify(storedTestAgentSessionRecord(live)))
-      await closeTestJournalHostDatabase(directory)
+      await withTestAgentSessionDatabase(directory, (db) => {
+        const insert = db.prepare('INSERT INTO agent_session_records (session_id, record_json) VALUES (?, ?)')
+        insert.run('idle', JSON.stringify(storedTestAgentSessionRecord(idle)))
+        insert.run('live', JSON.stringify(storedTestAgentSessionRecord(live)))
+      })
       // This build: only the lease that may be held is marked.
       const current = await openTestAgentSessionRecordStore(directory)
       expect(current.getRecord('idle')?.lease.unreconciled).toBe(false)
       expect(current.getRecord('live')?.lease.unreconciled).toBe(true)
       await closeTestAgentSessionDatabase(directory)
-      const db = openTestJournalHostDatabase(directory).db
-      expect(savedFlags(db)).toEqual({ idle: false, live: true })
       const checkout = await materializeReleaseCheckout(ref)
       const rows = await importReleaseCheckoutModule(checkout, 'src/main/runtime/agent-session/records/agent-session-record-rows.ts')
       const open = (rows.installAgentSessionStoreRows ?? rows.loadAgentSessionStoreRows) as (db: unknown) => unknown
-      const loaded = flags(open(db))
-      console.log(`L1-DOWNGRADE ${ref} uses ${rows.installAgentSessionStoreRows ? 'install' : 'load'}: in-memory ${JSON.stringify(loaded)} saved ${JSON.stringify(savedFlags(db))}`)
-      // The older build grants no writer to either chat until its own restart reconciliation.
-      expect(loaded).toEqual({ idle: true, live: true })
-      await closeTestJournalHostDatabase(directory)
+      await withTestAgentSessionDatabase(directory, (db) => {
+        expect(savedFlags(db)).toEqual({ idle: false, live: true })
+        const loaded = flags(open(db))
+        console.log(`L1-DOWNGRADE ${ref} uses ${rows.installAgentSessionStoreRows ? 'install' : 'load'}: in-memory ${JSON.stringify(loaded)} saved ${JSON.stringify(savedFlags(db))}`)
+        // The older build grants no writer to either chat until its own restart reconciliation.
+        expect(loaded).toEqual({ idle: true, live: true })
+      })
       // Back on this build after the older one left every lease marked (e.g. it quit before reconciling).
       const reopened = await openTestAgentSessionRecordStore(directory)
       expect(reopened.getRecord('idle')?.lease.unreconciled).toBe(rows.installAgentSessionStoreRows ? true : false)
